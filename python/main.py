@@ -3,8 +3,11 @@ import numpy as np
 import os
 import csv
 import shutil
+import time
 from pathlib import Path
 from datetime import datetime
+
+from servo_serial import ServoSerial  # <-- NEW
 
 # ----------------------------
 # Config
@@ -17,6 +20,22 @@ CAM_INDEX = 0
 
 # Approx camera field-of-view (horizontal only for pan)
 FOV_X_DEG = 60.0
+
+# ----------------------------
+# Servo control config (NEW)
+# ----------------------------
+SERVO_PORT = "COM5"
+SERVO_BAUD = 115200
+
+SERVO_CENTER = 90
+SERVO_MIN = 10
+SERVO_MAX = 170
+
+GAIN = 1.2          # lower = softer, higher = more aggressive
+DEADBAND_DEG = 1.0  # ignore small error to avoid jitter
+ALPHA = 0.25        # smoothing (0..1)
+SEND_HZ = 20        # limit serial writes
+MIN_STEP = 1        # ignore tiny angle changes
 
 # Default HSV range to catch yellow-green / lime / green
 DEFAULTS = {
@@ -162,130 +181,161 @@ def main():
     cv2.namedWindow(WINDOW_MASK, cv2.WINDOW_NORMAL)
     create_trackbars()
 
+    # ----------------------------
+    # Servo setup (NEW)
+    # ----------------------------
+    servo = ServoSerial(port=SERVO_PORT, baud=SERVO_BAUD)
+    servo_angle = float(SERVO_CENTER)
+    servo_smoothed = float(SERVO_CENTER)
+    send_interval = 1.0 / SEND_HZ
+
     logging_on = False
     log_path = None
     log_file = None
     log_writer = None
 
-    while True:
-        ret, frame = cap.read()
-        if not ret or frame is None:
-            print("ERROR: Failed to read frame.")
-            break
+    try:
+        while True:
+            ret, frame = cap.read()
+            if not ret or frame is None:
+                print("ERROR: Failed to read frame.")
+                break
 
-        frame = cv2.flip(frame, 1)
+            frame = cv2.flip(frame, 1)
 
-        h, w = frame.shape[:2]
-        cx, cy = w // 2, h // 2
+            h, w = frame.shape[:2]
+            cx, cy = w // 2, h // 2
 
-        hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
-        lower, upper, min_area, hsv_vals = get_hsv_from_trackbars()
-        hmin, hmax, smin, smax, vmin, vmax = hsv_vals
+            hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+            lower, upper, min_area, hsv_vals = get_hsv_from_trackbars()
+            hmin, hmax, smin, smax, vmin, vmax = hsv_vals
 
-        mask = cv2.inRange(hsv, lower, upper)
+            mask = cv2.inRange(hsv, lower, upper)
 
-        mask = cv2.GaussianBlur(mask, (7, 7), 0)
-        kernel = np.ones((5, 5), np.uint8)
-        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=1)
-        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=2)
+            mask = cv2.GaussianBlur(mask, (7, 7), 0)
+            kernel = np.ones((5, 5), np.uint8)
+            mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=1)
+            mask = cv2.morphologyEx(
+                mask, cv2.MORPH_CLOSE, kernel, iterations=2)
 
-        contours, _ = cv2.findContours(
-            mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            contours, _ = cv2.findContours(
+                mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
-        target_found = False
-        tx = 0
-        ty = 0
-        area_px = 0.0
-        err_x = 0
-        ang_x = 0.0
+            target_found = False
+            tx = 0
+            ty = 0
+            area_px = 0.0
+            err_x = 0
+            ang_x = 0.0
 
-        if contours:
-            best = max(contours, key=cv2.contourArea)
-            area_px = float(cv2.contourArea(best))
+            if contours:
+                best = max(contours, key=cv2.contourArea)
+                area_px = float(cv2.contourArea(best))
 
-            if area_px >= max(50, min_area):
-                M = cv2.moments(best)
-                if M["m00"] != 0:
-                    tx = int(M["m10"] / M["m00"])
-                    ty = int(M["m01"] / M["m00"])
-                    target_found = True
+                if area_px >= max(50, min_area):
+                    M = cv2.moments(best)
+                    if M["m00"] != 0:
+                        tx = int(M["m10"] / M["m00"])
+                        ty = int(M["m01"] / M["m00"])
+                        target_found = True
 
-                    cv2.drawContours(frame, [best], -1, COLOR_TARGET, 2)
-                    cv2.circle(frame, (tx, ty), 8, COLOR_TARGET, -1)
+                        cv2.drawContours(frame, [best], -1, COLOR_TARGET, 2)
+                        cv2.circle(frame, (tx, ty), 8, COLOR_TARGET, -1)
 
-                    err_x = tx - cx
-                    ang_x = (err_x / w) * FOV_X_DEG
+                        err_x = tx - cx
+                        ang_x = (err_x / w) * FOV_X_DEG
 
-        draw_crosshair(frame, cx, cy)
+            # ----------------------------
+            # Servo control (NEW)
+            # ----------------------------
+            if target_found:
+                if abs(ang_x) > DEADBAND_DEG:
+                    # If it moves the wrong direction, flip the sign (+ instead of -)
+                    servo_angle = servo_angle - (GAIN * ang_x)
 
-        if target_found:
-            put_label(frame, "Target: FOUND", 20, 45,
-                      COLOR_OK, scale=1.2, thickness=3)
-            put_label(frame, f"Error px:  X={err_x:+d}", 20, 85, COLOR_TEXT)
-            put_label(frame, f"Angle deg: X={ang_x:+.2f}", 20, 120, COLOR_TEXT)
-        else:
-            put_label(frame, "Target: NOT FOUND", 20, 45,
-                      COLOR_BAD, scale=1.2, thickness=3)
-            put_label(frame, "Error px:  X=  0", 20, 85, COLOR_TEXT)
-            put_label(frame, "Angle deg: X=+0.00", 20, 120, COLOR_TEXT)
+                servo_angle = max(SERVO_MIN, min(SERVO_MAX, servo_angle))
+                servo_smoothed = (1 - ALPHA) * \
+                    servo_smoothed + ALPHA * servo_angle
 
-        put_label(frame, f"Logging: {'ON' if logging_on else 'OFF'}",
-                  20, 155, COLOR_TEXT)
+                servo.send(
+                    int(round(servo_smoothed)),
+                    min_interval=send_interval,
+                    min_step=MIN_STEP
+                )
 
-        # Write row while logging is ON
-        if logging_on and log_writer is not None:
-            ts_iso = datetime.now().isoformat(timespec="milliseconds")
-            log_writer.writerow([
-                ts_iso,
-                w,
-                h,
-                1 if target_found else 0,
-                tx if target_found else "",
-                ty if target_found else "",
-                cx,
-                cy,
-                err_x if target_found else "",
-                f"{ang_x:.6f}" if target_found else "",
-                f"{area_px:.2f}" if target_found else "",
-                hmin, hmax, smin, smax, vmin, vmax,
-                min_area,
-            ])
+            draw_crosshair(frame, cx, cy)
 
-        cv2.imshow(WINDOW_MAIN, frame)
-        cv2.imshow(WINDOW_MASK, mask)
-
-        key = cv2.waitKey(1) & 0xFF
-
-        # Quit
-        if key == ord("q") or key == 27:
-            break
-
-        # Toggle logging
-        if key == ord("r"):
-            if not logging_on:
-                # TURN ON: always start a fresh log file (resets each run)
-                # Close any previous handle just in case
-                if log_file is not None:
-                    finalize_log(log_path, log_file)
-
-                log_path, log_file, log_writer = create_log_file()
-                logging_on = True
-                print(f"Logging started: {log_path}")
+            if target_found:
+                put_label(frame, "Target: FOUND", 20, 45,
+                          COLOR_OK, scale=1.2, thickness=3)
+                put_label(
+                    frame, f"Error px:  X={err_x:+d}", 20, 85, COLOR_TEXT)
+                put_label(
+                    frame, f"Angle deg: X={ang_x:+.2f}", 20, 120, COLOR_TEXT)
             else:
-                # TURN OFF: close and save, update latest
-                logging_on = False
-                finalize_log(log_path, log_file)
-                log_path = None
-                log_file = None
-                log_writer = None
-                print("Logging paused")
+                put_label(frame, "Target: NOT FOUND", 20, 45,
+                          COLOR_BAD, scale=1.2, thickness=3)
+                put_label(frame, "Error px:  X=  0", 20, 85, COLOR_TEXT)
+                put_label(frame, "Angle deg: X=+0.00", 20, 120, COLOR_TEXT)
 
-    cap.release()
-    cv2.destroyAllWindows()
+            put_label(frame, f"Logging: {'ON' if logging_on else 'OFF'}",
+                      20, 155, COLOR_TEXT)
 
-    # If user quits while logging is still ON, finalize it too
-    if log_file is not None:
-        finalize_log(log_path, log_file)
+            # Write row while logging is ON
+            if logging_on and log_writer is not None:
+                ts_iso = datetime.now().isoformat(timespec="milliseconds")
+                log_writer.writerow([
+                    ts_iso,
+                    w,
+                    h,
+                    1 if target_found else 0,
+                    tx if target_found else "",
+                    ty if target_found else "",
+                    cx,
+                    cy,
+                    err_x if target_found else "",
+                    f"{ang_x:.6f}" if target_found else "",
+                    f"{area_px:.2f}" if target_found else "",
+                    hmin, hmax, smin, smax, vmin, vmax,
+                    min_area,
+                ])
+
+            cv2.imshow(WINDOW_MAIN, frame)
+            cv2.imshow(WINDOW_MASK, mask)
+
+            key = cv2.waitKey(1) & 0xFF
+
+            # Quit
+            if key == ord("q") or key == 27:
+                break
+
+            # Toggle logging
+            if key == ord("r"):
+                if not logging_on:
+                    if log_file is not None:
+                        finalize_log(log_path, log_file)
+
+                    log_path, log_file, log_writer = create_log_file()
+                    logging_on = True
+                    print(f"Logging started: {log_path}")
+                else:
+                    logging_on = False
+                    finalize_log(log_path, log_file)
+                    log_path = None
+                    log_file = None
+                    log_writer = None
+                    print("Logging paused")
+
+    finally:
+        cap.release()
+        cv2.destroyAllWindows()
+
+        # Close serial
+        servo.close()
+
+        # If user quits while logging is still ON, finalize it too
+        if log_file is not None:
+            finalize_log(log_path, log_file)
 
 
 if __name__ == "__main__":
